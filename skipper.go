@@ -279,6 +279,9 @@ type Options struct {
 	// pods within a service
 	KubernetesEnableEndpointslices bool
 
+	// KubernetesEnableIngressEvents enables Warning Events for Ingress conversion diagnostics.
+	KubernetesEnableIngressEvents bool
+
 	// *DEPRECATED* KubernetesEnableEastWest enables cluster internal service to service communication, aka east-west traffic
 	KubernetesEnableEastWest bool
 
@@ -1161,6 +1164,7 @@ func (o *Options) KubernetesDataClientOptions() kubernetes.Options {
 		KubernetesNamespace:                            o.KubernetesNamespace,
 		KubernetesEnableEastWest:                       o.KubernetesEnableEastWest,
 		KubernetesEnableEndpointslices:                 o.KubernetesEnableEndpointslices,
+		KubernetesEnableIngressEvents:                  o.KubernetesEnableIngressEvents,
 		KubernetesEastWestDomain:                       o.KubernetesEastWestDomain,
 		KubernetesEastWestRangeDomains:                 o.KubernetesEastWestRangeDomains,
 		KubernetesEastWestRangePredicates:              o.KubernetesEastWestRangePredicates,

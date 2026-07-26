@@ -70,6 +70,25 @@ func TestEnvOverrides_SwarmRedisPassword(t *testing.T) {
 	}
 }
 
+func TestIngressEventConfiguration(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+	}{
+		{name: "default"},
+		{name: "cli", args: []string{"-kubernetes-enable-ingress-events"}},
+		{name: "yaml", args: []string{"-config-file=testdata/ingress_events.yaml"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewConfig()
+			require.NoError(t, cfg.ParseArgs("skipper", tt.args))
+			want := tt.name != "default"
+			require.Equal(t, want, cfg.KubernetesEnableIngressEvents)
+			require.Equal(t, want, cfg.ToOptions().KubernetesEnableIngressEvents)
+		})
+	}
+}
+
 func defaultConfig(with func(*Config)) *Config {
 	cfg := &Config{
 		Flags:                                   nil,

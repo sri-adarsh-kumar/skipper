@@ -50,6 +50,8 @@ type ingressContext struct {
 	calculateTraffic     func([]*weightedIngressBackend) map[string]backendTraffic
 	zone                 string
 	disableZoneAwareness bool
+	diagnostics          *[]ingressDiagnostic
+	pathOccurrence       string
 }
 
 type ingress struct {
@@ -425,18 +427,19 @@ func (ing *ingress) applyBackend(i *definitions.IngressV1Item, r *eskip.Route) {
 // convert logs if an invalid found, but proceeds with the valid ones.
 // Reporting failures in Ingress status is not possible, because
 // Ingress status field only supports IP and Hostname as string.
-func (ing *ingress) convert(state *clusterState, df defaultFilters, r *certregistry.CertRegistry, loggingEnabled bool) ([]*eskip.Route, error) {
+func (ing *ingress) convert(state *clusterState, df defaultFilters, r *certregistry.CertRegistry, loggingEnabled bool) ([]*eskip.Route, []ingressDiagnostic, error) {
 	var ewIngInfo map[string][]string // r.Id -> {namespace, name}
 	if ing.kubernetesEnableEastWest {
 		ewIngInfo = make(map[string][]string)
 	}
 	routes := make([]*eskip.Route, 0, len(state.ingressesV1))
+	diagnostics := make([]ingressDiagnostic, 0)
 	hostRoutes := make(map[string][]*eskip.Route)
 	redirect := createRedirectInfo(ing.provideHTTPSRedirect, ing.httpsRedirectCode)
 	for _, i := range state.ingressesV1 {
-		r, err := ing.ingressV1Route(i, redirect, state, hostRoutes, df, r, loggingEnabled)
+		r, err := ing.ingressV1Route(i, redirect, state, hostRoutes, df, r, loggingEnabled, &diagnostics)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if r != nil {
 			routes = append(routes, r)
@@ -476,7 +479,7 @@ func (ing *ingress) convert(state *clusterState, df defaultFilters, r *certregis
 		log.Infof("Enabled east west routes: %d %d %d %d", l, len(routes), len(ewroutes), len(hostRoutes))
 	}
 
-	return routes, nil
+	return routes, diagnostics, nil
 }
 
 func generateTLSCertFromSecret(secret *secret) (*tls.Certificate, error) {

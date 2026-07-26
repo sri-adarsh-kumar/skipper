@@ -184,6 +184,7 @@ type Config struct {
 	KubernetesPathMode                                   kubernetes.PathMode                `yaml:"-"`
 	KubernetesNamespace                                  string                             `yaml:"kubernetes-namespace"`
 	KubernetesEnableEndpointSlices                       bool                               `yaml:"enable-kubernetes-endpointslices"`
+	KubernetesEnableIngressEvents                        bool                               `yaml:"kubernetes-enable-ingress-events"`
 	KubernetesTopologyZone                               string                             `yaml:"kubernetes-topology-zone"`
 	KubernetesEnableEastWest                             bool                               `yaml:"enable-kubernetes-east-west"`
 	KubernetesEastWestDomain                             string                             `yaml:"kubernetes-east-west-domain"`
@@ -566,6 +567,7 @@ func NewConfig() *Config {
 	flag.StringVar(&cfg.KubernetesPathModeString, "kubernetes-path-mode", "kubernetes-ingress", "controls the default interpretation of Kubernetes ingress paths: <kubernetes-ingress|path-regexp|path-prefix>")
 	flag.StringVar(&cfg.KubernetesNamespace, "kubernetes-namespace", "", "watch only this namespace for ingresses")
 	flag.BoolVar(&cfg.KubernetesEnableEndpointSlices, "enable-kubernetes-endpointslices", false, "Enables that skipper fetches Kubernetes endpointslices instead of endpoints to scale more than 1000 pods within a service")
+	flag.BoolVar(&cfg.KubernetesEnableIngressEvents, "kubernetes-enable-ingress-events", false, "enables Warning Events for Kubernetes Ingress conversion diagnostics")
 	flag.StringVar(&cfg.KubernetesTopologyZone, "kubernetes-topology-zone", "", "sets the topology zone to be used for zone aware routing")
 	flag.BoolVar(&cfg.KubernetesEnableEastWest, "enable-kubernetes-east-west", false, "*Deprecated*: use kubernetes-east-west-range feature. Enables east-west communication, which automatically adds routes for Ingress objects with hostname <name>.<namespace>.skipper.cluster.local")
 	flag.StringVar(&cfg.KubernetesEastWestDomain, "kubernetes-east-west-domain", "", "*Deprecated*: use kubernetes-east-west-range feature. Sets the east-west domain, defaults to .skipper.cluster.local")
@@ -1054,6 +1056,7 @@ func (c *Config) ToOptions() skipper.Options {
 		KubernetesPathMode:                             c.KubernetesPathMode,
 		KubernetesNamespace:                            c.KubernetesNamespace,
 		KubernetesEnableEndpointslices:                 c.KubernetesEnableEndpointSlices,
+		KubernetesEnableIngressEvents:                  c.KubernetesEnableIngressEvents,
 		KubernetesTopologyZone:                         c.KubernetesTopologyZone,
 		KubernetesEnableEastWest:                       c.KubernetesEnableEastWest,
 		KubernetesEastWestDomain:                       c.KubernetesEastWestDomain,

@@ -100,6 +100,9 @@ type Options struct {
 	// endpointslices instead of endpoints to scale more than 1000 pods within a service
 	KubernetesEnableEndpointslices bool
 
+	// KubernetesEnableIngressEvents enables Warning Events for Ingress conversion diagnostics.
+	KubernetesEnableIngressEvents bool
+
 	// *DEPRECATED* KubernetesEnableEastWest if set adds automatically routes
 	// with "%s.%s.skipper.cluster.local" domain pattern
 	KubernetesEnableEastWest bool
@@ -454,7 +457,7 @@ func (c *Client) loadAndConvert() ([]*eskip.Route, error) {
 
 	defaultFilters := c.fetchDefaultFilterConfigs()
 
-	ri, err := c.ingress.convert(state, defaultFilters, c.ClusterClient.certificateRegistry, loggingEnabled)
+	ri, diagnostics, err := c.ingress.convert(state, defaultFilters, c.ClusterClient.certificateRegistry, loggingEnabled)
 	if err != nil {
 		return nil, err
 	}
@@ -462,6 +465,13 @@ func (c *Client) loadAndConvert() ([]*eskip.Route, error) {
 	rg, err := c.routeGroups.convert(state, defaultFilters, loggingEnabled, c.ClusterClient.certificateRegistry)
 	if err != nil {
 		return nil, err
+	}
+
+	if c.ClusterClient.ingressEvents != nil {
+		allDiagnostics := make([]ingressDiagnostic, 0, len(state.ingressDiagnostics)+len(diagnostics))
+		allDiagnostics = append(allDiagnostics, state.ingressDiagnostics...)
+		allDiagnostics = append(allDiagnostics, diagnostics...)
+		c.ClusterClient.ingressEvents.reconcile(allDiagnostics)
 	}
 
 	r := append(ri, rg...)
@@ -642,16 +652,19 @@ func compareStringList(a, b []string) []string {
 
 // addTLSCertToRegistry adds a TLS certificate to the certificate registry per host using the provided
 // Kubernetes TLS secret
-func addTLSCertToRegistry(cr *certregistry.CertRegistry, logger *logger, hosts []string, secret *secret) {
+func addTLSCertToRegistry(cr *certregistry.CertRegistry, logger *logger, hosts []string, secret *secret) bool {
 	cert, err := generateTLSCertFromSecret(secret)
 	if err != nil {
 		logger.Errorf("Failed to generate TLS certificate from secret: %v", err)
-		return
+		return false
 	}
+	success := true
 	for _, host := range hosts {
 		err := cr.ConfigureCertificate(host, cert)
 		if err != nil {
 			logger.Errorf("Failed to configure certificate: %v", err)
+			success = false
 		}
 	}
+	return success
 }
