@@ -40,6 +40,16 @@ func TestStartValidationRequiresTLS(t *testing.T) {
 	assert.Contains(t, err.Error(), "requires TLS")
 }
 
+func TestValidationMetricsHandler(t *testing.T) {
+	h := newValidationHandler(false, routing.Options{})
+	r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rw := httptest.NewRecorder()
+
+	h.ServeHTTP(rw, r)
+	assert.Equal(t, http.StatusOK, rw.Code)
+	assert.Contains(t, rw.Body.String(), "# HELP go_goroutines")
+}
+
 func TestValidationHandlers(t *testing.T) {
 	testCases := []struct {
 		name                     string

@@ -265,14 +265,232 @@ default timeout of 2s, which can be changed by the flag
 ## Monitoring
 
 Monitoring is one of the most important things you need to run in
-production and skipper has a [godoc page](https://pkg.go.dev/github.com/zalando/skipper)
-for the [metrics package](https://pkg.go.dev/github.com/zalando/skipper/metrics),
-describing options and most keys you will find in the metrics handler
-endpoint. The default is listening on `:9911/metrics`. You can modify
-the listen port with the `-support-listener` flag. Metrics can exposed
-using formats Codahale (json) or Prometheus and be configured by
-`-metrics-flavour=`, which defaults to `codahale`. To expose both
-formats you can use a comma separated list: `-metrics-flavour=codahale,prometheus`.
+production. Skipper supports Coda Hale JSON, Prometheus exposition, and
+OpenTelemetry (OTel) metrics. The command-line default enables all three
+formats. A library user that constructs `metrics.Options{}` without a format
+selects Coda Hale only.
+
+### Metrics formats and endpoint
+
+The support listener exposes `/metrics` on `:9911` by default. Configure it
+with `-support-listener`. When it is empty, Skipper falls back to the legacy
+`-metrics-listener`; set both values empty to disable the support endpoint.
+
+Use `-metrics-flavour` with a comma-separated list of `codahale`,
+`prometheus`, and `otel` values. Coda Hale and Prometheus expose an HTTP
+endpoint; OTel periodically exports metrics with OTLP/HTTP and does not expose
+a metrics handler by itself.
+
+```sh
+# Coda Hale JSON
+skipper -metrics-flavour=codahale
+
+# Prometheus scrape endpoint
+skipper -metrics-flavour=prometheus
+
+# OTel OTLP/HTTP exporter
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 skipper -metrics-flavour=otel
+```
+
+Metrics are created when they are observed. Consequently, an inactive Coda
+Hale backend can return `404` from `/metrics`; Prometheus with runtime metrics
+enabled returns its runtime and process collectors with `200` before proxy
+traffic arrives.
+
+The validation webhook owns a separate Prometheus endpoint at HTTPS
+`/metrics` on `-validation-webhook-address` (default `:9000`). It requires
+`-validation-webhook-enabled` and both
+`-validation-webhook-cert-file` and `-validation-webhook-key-file`. It is not
+served by the support listener.
+
+### Filtering metrics
+
+Coda Hale returns JSON and supports lookup by full key or prefix. The prefix
+is `skipper.` by default and can be changed with `-metrics-prefix`.
+
+```sh
+# All created metrics
+curl http://127.0.0.1:9911/metrics
+
+# One created metric
+curl http://127.0.0.1:9911/metrics/skipper.proxy.total
+
+# Every created metric whose key starts with skipper.proxy
+curl http://127.0.0.1:9911/metrics/skipper.proxy
+```
+
+An exact key takes precedence over prefix matching. Coda Hale returns `404`
+for an unknown key or prefix, including an empty registry. A small prefix
+response looks like this:
+
+```json
+{
+  "timers": {
+    "skipper.proxy.total": {
+      "count": 1,
+      "min": 125000,
+      "max": 125000
+    }
+  }
+}
+```
+
+When Coda Hale and Prometheus are enabled together, the default response is
+Prometheus. Request Coda Hale explicitly:
+
+```sh
+curl -H 'Accept: application/codahale+json' http://127.0.0.1:9911/metrics/skipper.proxy
+```
+
+Prometheus always returns the complete registry. `/metrics/<suffix>` also
+reaches the Prometheus handler and returns the complete registry, not a
+filtered response. Select series in PromQL instead:
+
+```promql
+skipper_proxy_total_duration_seconds_count
+```
+
+OTel has no HTTP metrics handler. Its exporter sends the configured metrics to
+the OTLP/HTTP receiver at the export interval.
+
+### Core proxy metrics
+
+The following fixed metric families are emitted by the metrics backends. In
+the Coda Hale column, `<p>` is the configured prefix (`skipper.` for the CLI
+default). A bare library `metrics.Options{}` has no Coda Hale prefix.
+Prometheus and OTel use the configured prefix as their namespace with a
+trailing dot removed, or fall back to `skipper` when it is empty; the table
+shows that namespace. Histogram names
+represent the base family, so Prometheus exposes the usual `_bucket`, `_sum`,
+and `_count` series.
+
+| Family and purpose | Coda Hale key | Prometheus and OTel name | Labels or key domain | Type and enablement | Formats |
+| --- | --- | --- | --- | --- | --- |
+| Route lookup and route failure | `<p>routelookup`; `<p>routefailure` | `skipper_route_lookup_duration_seconds`; `skipper_route_error_total` | none | timer; counter, always | Coda Hale, Prometheus, OTel |
+| Filter lifecycle | `<p>filter.<filter>.create`, `.request`, `.response` | `skipper_filter_create_duration_seconds`, `skipper_filter_request_duration_seconds`, `skipper_filter_response_duration_seconds` | filter | timers/histograms, always | Coda Hale, Prometheus, OTel |
+| All filters per route and combined | `<p>allfilters.request.<route>`, `.response.<route>`, `<p>allfilters.combined.request`, `.response` | `skipper_filter_all_request_duration_seconds`, `skipper_filter_all_response_duration_seconds`, `skipper_filter_all_combined_request_duration_seconds`, `skipper_filter_all_combined_response_duration_seconds` | route for per-route families | timers/histograms; per-route requires `-all-filters-metrics`, combined is always | Coda Hale, Prometheus, OTel |
+| Response handling | `<p>response.<code>.<method>.skipper.<route>`; `<p>all.response.<code>.<method>.skipper` | `skipper_response_duration_seconds` | code, method, route; combined has empty route | timer/histogram; route requires `-route-response-metrics`, combined requires `-combined-response-metrics` | Coda Hale, Prometheus, OTel |
+| Response size | none | `skipper_response_size_bytes` | host | histogram, always observed | Prometheus, OTel |
+| Backend request headers | none | `skipper_backend_request_header_bytes` | host | histogram, always observed | Prometheus, OTel |
+| Backend duration | `<p>backend.<route>`; `<p>all.backend` | `skipper_backend_duration_seconds`; `skipper_backend_combined_duration_seconds` | route, host, zone; combined has none | timers/histograms; route requires `-route-backend-metrics`, combined is always | Coda Hale, Prometheus, OTel |
+| Backend host and zone | `<p>backendhost.<host>`; `<p>backendzone.<zone>` | `skipper_backend_duration_seconds` | host or zone, with other dimensions empty | timer/histogram; require `-backend-host-metrics` or `-backend-zone-metrics` | Coda Hale, Prometheus, OTel |
+| Proxy latency | `<p>proxy.total`, `.request`, `.response` | `skipper_proxy_total_duration_seconds`, `skipper_proxy_request_duration_seconds`, `skipper_proxy_response_duration_seconds` | none | total always; request and response require their respective proxy flags | Coda Hale, Prometheus, OTel |
+| Backend 5xx and backend errors | `<p>all.backend.5xx`; `<p>errors.backend.<route>` | `skipper_backend_5xx_duration_seconds`; `skipper_backend_error_total` | route for errors | timer/histogram; the counter requires `-route-backend-error-counters` for Coda Hale and OTel, but Prometheus always records it | Coda Hale, Prometheus, OTel |
+| Streaming errors | `<p>errors.streaming.<route>` | `skipper_streaming_error_total` | route | counter; requires `-route-stream-error-counters` for Coda Hale and OTel, but Prometheus always records it | Coda Hale, Prometheus, OTel |
+| Serve route and host duration | `<p>serveroute.<route>[.<method>][.<code>]`; `<p>servehost.<host>[.<method>][.<code>]` | `skipper_serve_route_duration_seconds`; `skipper_serve_host_duration_seconds` | route or host; optional code and method | timer/histogram; require `-serve-route-metrics` or `-serve-host-metrics` | Coda Hale, Prometheus, OTel |
+| Serve route and host count | none | `skipper_serve_route_count`; `skipper_serve_host_count` | route or host, code, method | counters; require `-serve-route-counter` or `-serve-host-counter` | Prometheus, OTel |
+| Invalid routes | `<p>route.invalid.<route_id>.<reason>` | `skipper_route_invalid` | route_id, reason | gauge, when validation records an invalid route | Coda Hale, Prometheus, OTel |
+| Custom duration, count, and gauge | `<p><key>` | `skipper_custom_duration_seconds`; `skipper_custom_total`; `skipper_custom_gauges` | key | timer/histogram, counter, gauge; supplied by caller | Coda Hale, Prometheus, OTel |
+
+Route IDs, hosts, filters, status codes, methods, zones, and custom keys
+create separate series. Enable per-route, per-host, or per-filter dimensions
+only when their cardinality is acceptable for the metric backend and scraper.
+Coda Hale intentionally does not emit backend request-header or response-size
+observations.
+
+Host values in metric dimensions are not always literal. Coda Hale normalizes
+the backend-host, backend-zone, and serve-host key segments by replacing `.`
+with `_` and `:` with `__`. Prometheus and OTel apply the same normalization to
+the response-size, backend-request-header, and serve-host labels.
+
+### Component and custom metrics
+
+Fixed Skipper component metrics use the custom metric family in Prometheus and
+OTel (`skipper_custom_*` with a `key` label) and a Coda Hale key below. They
+are not a separate static Prometheus metric name. RouteSRV is an exception: it
+creates a Prometheus-only backend with the `routesrv` namespace. Dynamic
+segments are part of the key and can increase cardinality.
+
+| Component | Fixed key pattern or direct collector | Type, dimensions, and enablement | Formats | Reference |
+| --- | --- | --- | --- | --- |
+| Routing updates | `routes.load_all.<dataclient>`, `routes.load_update.<dataclient>`, `routes.update_latency`, `routes.total`, `routes.updated_timestamp` | timers and gauges while routes load or update; `<dataclient>` is dynamic | All, custom family | [RouteSRV metrics](#routesrv-metrics) |
+| RouteSRV polling | `routes.fetch_errors`, `routes.empty`, `routes.byte`, `routes.total`, `routes.updated_timestamp` | counters and gauges while RouteSRV polls route data | Prometheus only, `routesrv_custom_*` family | [RouteSRV metrics](#routesrv-metrics) |
+| Proxy protocol and compression | `incoming.<protocol>`, `outgoing.<protocol>`, `experimental.uncompressed` | counters; `<protocol>` is the inbound or outbound HTTP protocol. Incoming increments for every proxy request, outgoing for every backend round trip, and uncompressed for a backend response transparently decompressed by Go. Always emitted. | All, custom family | [Proxy Metrics](#proxy-metrics) |
+| Route creation | `routeCreationTime.<origin>` | timer; `<origin>` is the OriginMarker source identifier; requires `-route-creation-metrics` | All, custom family | [OriginMarker](../reference/filters.md#originmarker) |
+| HTTP connections | `lb-conn-<state>`, `lb-conn-closed.keepalive`, `lb-conn-closed.keepalive-requests` | counters; `<state>` is an `http.ConnState`; requires `-enable-connection-metrics` | All, custom family | [Connection metrics](#connection-metrics) |
+| TCP queue listener | `listener.accepted.connections`, `listener.queued.connections`, `listener.accept.latency` | first two gauges, last a timer; no dynamic dimensions; requires `-enable-tcp-queue` | All, custom family | [Connection metrics](#connection-metrics) |
+| FIFO and LIFO queues | `fifo.<route>.active`, `.queued`, `.error.full`, `.error.other`, `.error.timeout`; equivalent `lifo.<route>.*` keys | active and queued are gauges; error keys are counters; `<route>` is `unknown` when absent; require `-enable-route-fifo-metrics` or `-enable-route-lifo-metrics` | All, custom family | [LIFO metrics](#lifo-metrics) |
+| Passive health check | `passive-health-check.endpoints.dropped`, `passive-health-check.requests.passed` | counters; requires `-passive-health-check` configuration | All, custom family | [Passive health check metrics](#metrics) |
+| Redis and Valkey rate limiting | `swarm.redis.*`, `swarm.valkey.*`, rate-limit query latency and allow/forbid keys | gauges, counters, and timers when the corresponding client is used | All, custom family | [Redis - Rate limiting metrics](#redis---rate-limiting-metrics), [Valkey - Rate limiting metrics](#valkey---rate-limiting-metrics) |
+| Swarm messages | `swarm.messages.outgoing.queue`, `.outgoing.shared`, `.incoming.all`, `.incoming.shared`, `.incoming.broadcast` | outgoing queue is a gauge; the remaining keys are counters while Swarm is enabled | All, custom family | No dedicated guide section |
+| RouteSRV endpoints | `redis_endpoints`, `valkey_endpoints`, `<status>` | first two gauges when their endpoint lists are requested; `<status>` is an HTTP status-code counter when RouteSRV serves routes | Prometheus only, `routesrv_custom_*` family | [RouteSRV metrics](#routesrv-metrics) |
+| Cache and block filters | cache hit, miss, stale, revalidation, LRU keys; `blocked.requests` | counters and gauges when the filter is used | All, custom family | [Filters reference](../reference/filters.md) |
+| Token-info cache, admission control, JWT | `tokeninfocache.count`; admission total/reject keys; JWT metric keys | gauges and counters when the filter is used | All, custom family | [Filters reference](../reference/filters.md) |
+| OPA | `opa*.custom.decision.*.<bundle>`, `opa*.custom.eval_time.<bundle>` and direct `skipper_openpolicyagent_*` collectors | custom metrics when OPA filters are used; native OPA collectors are Prometheus only | Custom family for Coda Hale, Prometheus, OTel; native collectors Prometheus only | [Open Policy Agent metrics](#open-policy-agent-metrics) |
+| API usage | endpoint: `apiUsageMonitoring.custom.<application>.<tag>.<api>.<method>.<path>.*.*.(http_count|http[1-5]xx_count|httpxxx_count|latency)`; client: `apiUsageMonitoring.custom.<application>.<tag>.<api>.*.*.<realm>.<client>.(http_count|http[1-5]xx_count|httpxxx_count|latency_sum)` | counters and timer; client `latency_sum` is a float counter. Requires `-enable-api-usage-monitoring` and an `apiUsageMonitoring` filter; method, path, realm, and client are dynamic. | Prometheus and OTel for every type; Coda Hale drops `latency_sum` | [API usage monitoring](../reference/filters.md#apiusagemonitoring) |
+| RouteGroup admission requests | `routegroup_admission_admitter_requests`, `routegroup_admission_admitter_invalid_requests` | counters with `admitter` | Prometheus only; validation HTTPS listener requires `-validation-webhook-enabled` and both TLS files | [Route validation metrics](#route-validation-metrics) |
+| RouteGroup admission decisions | `routegroup_admission_admitter_rejected_admissions`, `routegroup_admission_admitter_successful_admissions`, `routegroup_admission_admitter_admission_duration` | first two counters and final histogram with `admitter`, `operation`, `group`, `version`, `resource`, `sub_resource` | Prometheus only; validation HTTPS listener requires `-validation-webhook-enabled` and both TLS files | [Route validation metrics](#route-validation-metrics) |
+
+Filters receive a prefixed metrics view: the filter name and `.custom.` are
+prepended to caller-provided keys. Filter authors can use `MeasureSince`,
+`IncCounter`, `IncCounterBy`, and `IncFloatCounterBy`. Library callers that
+hold `metrics.Metrics` can also use `UpdateGauge`. These operations become the
+matching custom timer/histogram, counter, and gauge in every applicable
+backend. Float counters are exposed by Prometheus and OTel as
+`skipper_custom_total{key=...}`; Coda Hale drops `IncFloatCounterBy` because it
+has no float counter type. The API usage client latency sum is one such float
+counter.
+
+### Metrics configuration
+
+The following flags affect metrics exposure, collection, or cardinality. The
+format column identifies the affected backend; `all` means Coda Hale,
+Prometheus, and OTel unless noted otherwise.
+
+| Flag | Default | Effect and format |
+| --- | --- | --- |
+| `-support-listener` | `:9911` | Support endpoint address; all HTTP metrics and profiling exposure. When empty, `-metrics-listener` is used; set both empty to disable it. |
+| `-metrics-listener` | `:9911` | Compatibility fallback only when `-support-listener` is empty. |
+| `-metrics-flavour` | `codahale,prometheus,otel` | Selects formats. OTel exports OTLP/HTTP; it does not add a scrape handler. |
+| `-enable-prometheus-metrics` | false | Deprecated. Adds Prometheus to `-metrics-flavour`. |
+| `-metrics-prefix` | `skipper.` | Coda Hale key prefix and Prometheus/OTel namespace; all. |
+| `-disable-metrics-compression` | false | Disables compression on the Prometheus handler. |
+| `-enable-prometheus-start-label` | false | Adds the high-cardinality `start` label to Prometheus counters. |
+| `-runtime-metrics` | true | Go runtime/process metrics; Coda Hale runtime statistics and Prometheus collectors. |
+| `-debug-gc-metrics` | false | Go debug GC statistics in Coda Hale. |
+| `-metrics-exp-decay-sample` | false | Uses an exponentially decaying Coda Hale timer reservoir. Ignored by Prometheus and OTel. |
+| `-histogram-metric-buckets` | backend default | Duration histogram buckets for Prometheus and OTel; ignored by Coda Hale. |
+| `-request-size-buckets` | `4096,8192,16384,65536` | Backend request-header histogram buckets for Prometheus and OTel; ignored by Coda Hale. |
+| `-response-size-buckets` | `1,512,1024,524288,1048576,536870912,1073741824` | Response-size histogram buckets for Prometheus and OTel; ignored by Coda Hale. |
+| `-enable-prometheus-native-histograms` | false | Adds native histograms while retaining classic buckets; Prometheus only. |
+| `-prometheus-native-histogram-bucket-factor` | `1.1` | Native-histogram resolution. It is ignored unless native histograms are enabled; values less than or equal to 1 are reset to `1.1`. |
+| `-enable-profile` | false | Exposes Go pprof handlers under `/debug/pprof/` on the support listener. Restrict this listener to trusted networks before enabling it. |
+| `-block-profile-rate` | 0 | Requires `-enable-profile`; positive values set the runtime block sampling rate, negative disables it, zero keeps the runtime default. |
+| `-mutex-profile-fraction` | 0 | Requires `-enable-profile`; positive values set the runtime mutex sampling fraction, negative disables it, zero keeps the runtime default. |
+| `-memory-profile-rate` | 0 | Requires `-enable-profile` in direct library options. The CLI parses this flag but `Config.ToOptions` does not propagate it, so it currently has no CLI effect. |
+
+| Detail and cardinality flag | Default | Effect and format |
+| --- | --- | --- |
+| `-serve-route-metrics`, `-serve-host-metrics` | false | Per-route or per-host duration metrics; all. Route IDs and hosts increase cardinality. |
+| `-serve-route-counter`, `-serve-host-counter` | false | Per-route or per-host request counters with code and method; Prometheus and OTel. |
+| `-serve-method-metric`, `-serve-status-code-metric` | true | Adds method and code to serve-duration dimensions; all. Does not remove these labels from serve counters. |
+| `-backend-host-metrics`, `-backend-zone-metrics` | false | Backend duration by host or backend zone; all. |
+| `-proxy-request-metrics`, `-proxy-response-metrics` | false | Detailed proxy duration metrics; all. |
+| `-all-filters-metrics` | compatibility default true | Per-route all-filter metrics; all. |
+| `-combined-response-metrics` | false | Response duration aggregated across routes; all. |
+| `-route-response-metrics`, `-route-backend-metrics` | compatibility default true | Per-route response or backend duration; all. |
+| `-route-backend-error-counters`, `-route-stream-error-counters` | compatibility default true | Controls per-route error counters in Coda Hale and OTel. Prometheus records both counter families regardless of these flags. |
+| `-disable-metrics-compat` | false | Disables the five compatibility defaults: all-filter, route-response, route-backend, backend-error, and streaming-error metrics. |
+
+| Component flag | Default | Effect and reference |
+| --- | --- | --- |
+| `-route-creation-metrics` | false | Route creation timers. |
+| `-enable-route-fifo-metrics`, `-enable-route-lifo-metrics` | false | Per-route scheduler queue metrics. |
+| `-enable-connection-metrics` | false | HTTP server connection-state metrics. See [Connection metrics](#connection-metrics). |
+| `-enable-tcp-queue` | false | Enables the TCP queue listener and its accepted/queued connection gauges and accept-latency timer. |
+| `-passive-health-check` | unset (disabled) | Enables passive health checking and its dropped-endpoint and passed-request counters. |
+| `-enable-api-usage-monitoring` | false | Enables the `apiUsageMonitoring` filter and its metrics. |
+| `-api-usage-monitoring-realm-keys` | empty | JWT property name(s) used to derive the API-usage realm metric key segment. |
+| `-api-usage-monitoring-client-keys` | `sub` | Comma-separated JWT property names used to derive the API-usage client metric key segment. |
+| `-api-usage-monitoring-default-client-tracking-pattern` | empty | Deprecated. Set `client_tracking_pattern` on the filter instead. |
+| `-api-usage-monitoring-realms-tracking-pattern` | `services` | Regular expression selecting realms for per-client API-usage metrics. |
+| `-validation-webhook-enabled` | false | Starts the separate HTTPS validation listener. |
+| `-validation-webhook-address` | `:9000` | Validation listener address. |
+| `-validation-webhook-cert-file`, `-validation-webhook-key-file` | empty | Both are required when the validation webhook is enabled; its Prometheus `/metrics` is not on the support listener. |
+
+The route, host, status, method, filter, zone, and custom-key dimensions can
+substantially increase memory use and scrape volume. Review the resulting
+registry before enabling high-cardinality options.
 
 ### Prometheus
 
@@ -1007,13 +1225,12 @@ metrics help monitor the health of route definitions and identify common configu
 
 The following gauge metrics show individual invalid routes with detailed context:
 
-- `skipper_route_invalid{route_id="<id>", reason="<reason>"}`: Individual invalid route (1 = invalid, 0 = was invalid but now valid)
+- `skipper_route_invalid{route_id="<id>", reason="<reason>"}`: Individual invalid route (1 = invalid)
 - `routes.total`: Total number of valid routes currently loaded (available as
   `routesrv_custom_gauges{key="routes.total"}` in RouteSRV)
 
-Each invalid route gets its own metric with the route ID and failure reason as labels. When a route becomes
-valid, its metric is automatically set to 0 (rather than deleted) to maintain time series continuity. This provides
-detailed tracking of exactly which routes are invalid and why, while preserving historical data for trend analysis.
+Each invalid route gets its own metric with the route ID and failure reason as labels. Skipper records an invalid
+route as 1 when validation observes it; existing series are not reset when a later update makes the route valid.
 
 #### Failure reasons
 
@@ -1037,10 +1254,6 @@ skipper_route_invalid{reason="unknown_filter",route_id="mobile_api"} 1
 skipper_route_invalid{reason="invalid_filter_params",route_id="bad_params_route"} 1
 skipper_route_invalid{reason="failed_backend_split",route_id="broken_backend_1"} 1
 skipper_route_invalid{reason="failed_backend_split",route_id="broken_backend_2"} 1
-
-# Routes that were invalid but are now fixed (set to 0 for historical tracking)
-skipper_route_invalid{reason="unknown_filter",route_id="fixed_route_1"} 0
-skipper_route_invalid{reason="failed_backend_split",route_id="fixed_route_2"} 0
 
 # HELP skipper_custom_gauges Gauges number of custom metrics.
 # TYPE skipper_custom_gauges gauge
@@ -1069,12 +1282,6 @@ skipper_custom_gauges{key="routes.total"} 1250
     },
     "route.invalid.broken_backend_2.failed_backend_split": {
       "value": 1
-    },
-    "route.invalid.fixed_route_1.unknown_filter": {
-      "value": 0
-    },
-    "route.invalid.fixed_route_2.failed_backend_split": {
-      "value": 0
     }
   }
 }
@@ -1087,7 +1294,7 @@ These metrics are particularly useful for:
 - Alerting on individual route configuration issues
 - Tracking which exact routes fail during updates
 - Debugging route-specific problems with detailed context
-- Historical analysis of route stability (metrics set to 0 when fixed, preserving time series)
+- Historical analysis of route validation failures over the retention period
 - Trend analysis over your retention period (e.g., 30 days)
 
 ## OpenTracing

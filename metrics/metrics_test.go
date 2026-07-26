@@ -73,6 +73,21 @@ func TestHandlerCodaHaleBadRequests(t *testing.T) {
 	}
 }
 
+func TestHandlerCodaHaleEmptyMetricsRequest(t *testing.T) {
+	o := metrics.Options{Format: metrics.CodaHaleKind}
+	m := metrics.NewCodaHale(o)
+	defer m.Close()
+
+	mh := metrics.NewHandler(o, m)
+	r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rw := httptest.NewRecorder()
+	mh.ServeHTTP(rw, r)
+
+	if rw.Code != http.StatusNotFound {
+		t.Fatalf("empty Coda Hale registry returned %d, want %d", rw.Code, http.StatusNotFound)
+	}
+}
+
 func TestHandlerCodaHaleAllMetricsRequest(t *testing.T) {
 	o := metrics.Options{
 		Format:               metrics.CodaHaleKind,
@@ -223,6 +238,93 @@ func TestHandlerCodaHaleUnknownMetricRequest(t *testing.T) {
 	mh.ServeHTTP(rw, r)
 	if rw.Code != http.StatusNotFound {
 		t.Error("Request for unknown metrics should return a Not Found status")
+	}
+}
+
+func TestHandlerPrometheusMetricsSuffixRequest(t *testing.T) {
+	for _, format := range []metrics.Kind{metrics.PrometheusKind, metrics.CodaHaleKind | metrics.PrometheusKind} {
+		t.Run("format", func(t *testing.T) {
+			o := metrics.Options{Format: format}
+			m := metrics.NewMetrics(o)
+			defer m.Close()
+			keys := []string{
+				"TestHandlerPrometheusMetricsSuffixRequestFirst",
+				"TestHandlerPrometheusMetricsSuffixRequestSecond",
+			}
+			for _, key := range keys {
+				m.IncCounter(key)
+			}
+			m.MeasureSince("TestHandlerPrometheusMetricsSuffixRequestDuration", time.Now())
+			m.UpdateGauge("TestHandlerPrometheusMetricsSuffixRequestGauge", 1)
+
+			mh := metrics.NewHandler(o, m)
+			bodies := make(map[string]string)
+			for _, path := range []string{"/metrics", "/metrics/any-suffix"} {
+				r := httptest.NewRequest(http.MethodGet, path, nil)
+				rw := httptest.NewRecorder()
+				mh.ServeHTTP(rw, r)
+
+				if rw.Code != http.StatusOK {
+					t.Fatalf("%s returned %d, want %d", path, rw.Code, http.StatusOK)
+				}
+				bodies[path] = rw.Body.String()
+				for _, key := range keys {
+					series := "skipper_custom_total{key=\"" + key + "\"}"
+					if !strings.Contains(bodies[path], series) {
+						t.Fatalf("%s did not return %q from the Prometheus registry", path, series)
+					}
+				}
+				for _, series := range []string{
+					"skipper_custom_duration_seconds_count{key=\"TestHandlerPrometheusMetricsSuffixRequestDuration\"} 1",
+					"skipper_custom_gauges{key=\"TestHandlerPrometheusMetricsSuffixRequestGauge\"} 1",
+				} {
+					if !strings.Contains(bodies[path], series) {
+						t.Fatalf("%s did not return %q from the Prometheus registry", path, series)
+					}
+				}
+			}
+			if bodies["/metrics/any-suffix"] != bodies["/metrics"] {
+				t.Fatal("Prometheus suffix response differs from the complete metrics registry")
+			}
+		})
+	}
+}
+
+func TestHandlerCombinedMetricsContentNegotiation(t *testing.T) {
+	o := metrics.Options{Format: metrics.CodaHaleKind | metrics.PrometheusKind}
+	m := metrics.NewMetrics(o)
+	defer m.Close()
+	m.IncCounter("TestHandlerCombinedMetricsContentNegotiation")
+
+	mh := metrics.NewHandler(o, m)
+	for _, test := range []struct {
+		name        string
+		path        string
+		accept      string
+		contentType string
+		body        string
+	}{
+		{name: "Prometheus by default", path: "/metrics/any-suffix", contentType: "text/plain", body: "skipper_custom_total"},
+		{name: "Coda Hale by Accept header", path: "/metrics/TestHandlerCombinedMetricsContentNegotiation", accept: "application/codahale+json", contentType: "application/json", body: "TestHandlerCombinedMetricsContentNegotiation"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, test.path, nil)
+			if test.accept != "" {
+				r.Header.Set("Accept", test.accept)
+			}
+			rw := httptest.NewRecorder()
+			mh.ServeHTTP(rw, r)
+
+			if rw.Code != http.StatusOK {
+				t.Fatalf("metrics handler returned %d, want %d", rw.Code, http.StatusOK)
+			}
+			if !strings.HasPrefix(rw.Header().Get("Content-Type"), test.contentType) {
+				t.Fatalf("content type %q, want prefix %q", rw.Header().Get("Content-Type"), test.contentType)
+			}
+			if !strings.Contains(rw.Body.String(), test.body) {
+				t.Fatalf("response does not contain %q", test.body)
+			}
+		})
 	}
 }
 
