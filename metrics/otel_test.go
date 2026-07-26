@@ -3,6 +3,7 @@ package metrics
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -306,6 +307,18 @@ func TestOTelRegisterHandler(t *testing.T) {
 	mux := http.NewServeMux()
 	o.RegisterHandler("/metrics", mux)
 	// no handler registered — the mux pattern list stays empty
+}
+
+func TestOTelHandlerDoesNotExposeMetrics(t *testing.T) {
+	o := newTestOTel(t, Options{})
+	h := NewHandler(Options{}, o)
+	r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rw := httptest.NewRecorder()
+
+	h.ServeHTTP(rw, r)
+	if rw.Code != http.StatusNotFound {
+		t.Fatalf("OTel-only metrics handler returned %d, want %d", rw.Code, http.StatusNotFound)
+	}
 }
 
 func TestOTelClose(t *testing.T) {
