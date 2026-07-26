@@ -228,6 +228,10 @@ Proxy-level config (`EnableMTLS`) presenting a client certificate when connectin
 **Ingress**:
 Standard Kubernetes Ingress resource converted to eskip routes by the Kubernetes dataclient.
 
+**Ingress Diagnostic**:
+A safe, structured report of a managed Ingress validation or conversion problem that can be published as a Kubernetes Warning Event.
+_Avoid_: ingress error
+
 **RouteGroup**:
 Custom Skipper CRD for advanced routing beyond what Ingress supports.
 

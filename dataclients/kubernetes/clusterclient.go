@@ -78,6 +78,7 @@ type clusterClient struct {
 	routeGroupsLabelSelectors    string
 
 	enableEndpointSlices bool
+	ingressEvents        *ingressEventReporter
 
 	loggedMissingRouteGroups bool
 	routeGroupValidator      *definitions.RouteGroupValidator
@@ -180,6 +181,9 @@ func newClusterClient(o Options, apiURL, ingCls, rgCls string, quit <-chan struc
 		enableEndpointSlices:         o.KubernetesEnableEndpointslices,
 		zone:                         o.TopologyZone,
 		ingressStatusFromService:     o.IngressStatusFromService,
+	}
+	if o.KubernetesEnableIngressEvents {
+		c.ingressEvents = newIngressEventReporter(c)
 	}
 
 	if o.KubernetesInCluster {
@@ -391,11 +395,11 @@ func sortByMetadata(slice interface{}, getMetadata func(int) *definitions.Metada
 	})
 }
 
-func (c *clusterClient) loadIngressesV1() ([]*definitions.IngressV1Item, error) {
+func (c *clusterClient) loadIngressesV1() ([]*definitions.IngressV1Item, []ingressDiagnostic, error) {
 	var il definitions.IngressV1List
 	if err := c.getJSON(c.ingressesURI+c.ingressLabelSelectors, &il); err != nil {
 		log.Debugf("requesting all ingresses failed: %v", err)
-		return nil, err
+		return nil, nil, err
 	}
 	log.Debugf("all ingresses received: %d", len(il.Items))
 
@@ -405,15 +409,17 @@ func (c *clusterClient) loadIngressesV1() ([]*definitions.IngressV1Item, error) 
 	sortByMetadata(fItems, func(i int) *definitions.Metadata { return fItems[i].Metadata })
 
 	validatedItems := make([]*definitions.IngressV1Item, 0, len(fItems))
+	diagnostics := make([]ingressDiagnostic, 0)
 	for _, i := range fItems {
 		if err := c.ingressValidator.Validate(i); err != nil {
 			log.Errorf("[ingress] %v", err)
+			diagnostics = append(diagnostics, ingressDiagnosticForMetadata(i.Metadata, invalidIngressReason, invalidIngressNote, "validation"))
 			continue
 		}
 		validatedItems = append(validatedItems, i)
 	}
 
-	return validatedItems, nil
+	return validatedItems, diagnostics, nil
 }
 
 func (c *clusterClient) LoadRouteGroups() ([]*definitions.RouteGroupItem, error) {
@@ -641,10 +647,11 @@ func (c *clusterClient) logMissingRouteGroupsOnce() {
 
 func (c *clusterClient) fetchClusterState() (*clusterState, error) {
 	var (
-		err         error
-		ingressesV1 []*definitions.IngressV1Item
+		err                error
+		ingressesV1        []*definitions.IngressV1Item
+		ingressDiagnostics []ingressDiagnostic
 	)
-	ingressesV1, err = c.loadIngressesV1()
+	ingressesV1, ingressDiagnostics, err = c.loadIngressesV1()
 	if err != nil {
 		return nil, err
 	}
@@ -668,6 +675,7 @@ func (c *clusterClient) fetchClusterState() (*clusterState, error) {
 
 	state := &clusterState{
 		ingressesV1:          ingressesV1,
+		ingressDiagnostics:   ingressDiagnostics,
 		routeGroups:          routeGroups,
 		services:             services,
 		cachedEndpoints:      make(map[endpointID][]string),

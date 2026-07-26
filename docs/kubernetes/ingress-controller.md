@@ -525,6 +525,41 @@ Add the following rule to your ClusterRole:
 If this permission is missing, Skipper logs Kubernetes RBAC "forbidden"
 errors when trying to write ingress status.
 
+## Publish Ingress Events
+
+Skipper can publish best-effort `events.k8s.io/v1` Warning Events for invalid
+Skipper Ingress annotations, omitted routes or default backends, and invalid
+TLS configuration. Enable this opt-in feature with:
+
+```bash
+skipper -kubernetes-enable-ingress-events
+```
+
+The equivalent YAML configuration is:
+
+```yaml
+kubernetes-enable-ingress-events: true
+```
+
+Skipper emits `InvalidIngress`, `RouteNotCreated`, and
+`InvalidTLSConfiguration` reasons. Each Skipper replica publishes an active
+diagnostic at most once every 30 minutes. Event delivery failures do not stop
+route reconciliation.
+
+### RBAC requirement for Ingress Events
+
+Grant the Skipper ServiceAccount permission to create Events before enabling
+the feature:
+
+```yaml
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+```
+
 ## Helm-based deployment
 
 Skipper is not available as a Helm chart.

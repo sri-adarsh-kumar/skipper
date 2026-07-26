@@ -202,6 +202,7 @@ func (ing *ingress) addEndpointsRuleV1(ic *ingressContext, host string, prule *d
 	if err != nil {
 		// if the service is not found the route should be removed
 		if err == errServiceNotFound || err == errResourceNotFound {
+			ic.addDiagnostic(routeNotCreatedReason, "service not found", ic.pathOccurrence)
 			return nil
 		}
 
@@ -210,11 +211,13 @@ func (ing *ingress) addEndpointsRuleV1(ic *ingressContext, host string, prule *d
 		// processing of the independent ingresses.
 		if errors.Is(err, errNotAllowedExternalName) {
 			ic.logger.Infof("Not allowed external name: %v", err)
+			ic.addDiagnostic(routeNotCreatedReason, "external name backend is not allowed", ic.pathOccurrence)
 			return nil
 		}
 
 		if errors.Is(err, errNotEnabledExternalName) {
 			ic.logger.Infof("Not enabled to reference external name from ingress: %s/%s", meta.Namespace, meta.Name)
+			ic.addDiagnostic(routeNotCreatedReason, "external name backend is not enabled", ic.pathOccurrence)
 			return nil
 		}
 
@@ -304,17 +307,19 @@ func computeBackendWeightsV1(calculateTraffic func([]*weightedIngressBackend) ma
 
 // TODO: default filters not applied to 'extra' routes from the custom route annotations. Is it on purpose?
 // https://github.com/zalando/skipper/issues/1287
-func (ing *ingress) addSpecRuleV1(ic *ingressContext, ru *definitions.RuleV1) error {
+func (ing *ingress) addSpecRuleV1(ic *ingressContext, ru *definitions.RuleV1, ruleIndex int) error {
 	if ru.Http == nil {
 		ic.logger.Infof("Skipping rule without http definition")
+		ic.addDiagnostic(routeNotCreatedReason, "rule without HTTP definition", fmt.Sprintf("rule:%d", ruleIndex))
 		return nil
 	}
 
 	trafficPerPathRule := computeBackendWeightsV1(ic.calculateTraffic, ic.backendWeights, ru)
 
-	for _, prule := range ru.Http.Paths {
+	for pathIndex, prule := range ru.Http.Paths {
 		ing.addExtraRoutes(ic, ru.Host, prule.Path, prule.PathType)
 		if trafficPerPathRule[prule].allowed() {
+			ic.pathOccurrence = fmt.Sprintf("rule:%d:path:%d", ruleIndex, pathIndex)
 			err := ing.addEndpointsRuleV1(ic, ru.Host, prule, trafficPerPathRule[prule])
 			if err != nil {
 				return err
@@ -326,16 +331,18 @@ func (ing *ingress) addSpecRuleV1(ic *ingressContext, ru *definitions.RuleV1) er
 
 // addSpecIngressTLSV1 is used to add TLS Certificates from Ingress resources. Certificates will be added
 // only if the Ingress rule host matches a host in TLS config
-func (ing *ingress) addSpecIngressTLSV1(ic *ingressContext, ingtls *definitions.TLSV1) {
+func (ing *ingress) addSpecIngressTLSV1(ic *ingressContext, ingtls *definitions.TLSV1, tlsIndex int) {
 	ingressHosts := definitions.GetHostsFromIngressRulesV1(ic.ingressV1)
 
 	// Hosts in the tls section need to explicitly match the host in the rules section.
 	hostlist := compareStringList(ingtls.Hosts, ingressHosts)
 	if len(hostlist) == 0 {
 		ic.logger.Errorf("No matching tls hosts found - tls hosts: %s, ingress hosts: %s", ingtls.Hosts, ingressHosts)
+		ic.addDiagnostic(invalidTLSConfigurationReason, "tls hosts do not match ingress rules", fmt.Sprintf("tls:%d", tlsIndex))
 		return
 	} else if len(hostlist) != len(ingtls.Hosts) {
 		ic.logger.Infof("Hosts in TLS and Ingress don't match: tls hosts: %s, ingress hosts: %s", ingtls.Hosts, definitions.GetHostsFromIngressRulesV1(ic.ingressV1))
+		ic.addDiagnostic(invalidTLSConfigurationReason, "tls hosts do not match ingress rules", fmt.Sprintf("tls:%d", tlsIndex))
 	}
 
 	// Skip adding certs to registry since no certs defined
@@ -349,9 +356,12 @@ func (ing *ingress) addSpecIngressTLSV1(ic *ingressContext, ingtls *definitions.
 	secret, ok := ic.state.secrets[secretID]
 	if !ok {
 		ic.logger.Errorf("Failed to find secret %s in namespace %s", secretID.Name, secretID.Namespace)
+		ic.addDiagnostic(invalidTLSConfigurationReason, "tls secret not found", fmt.Sprintf("tls:%d", tlsIndex))
 		return
 	}
-	addTLSCertToRegistry(ic.certificateRegistry, ic.logger, hostlist, secret)
+	if !addTLSCertToRegistry(ic.certificateRegistry, ic.logger, hostlist, secret) {
+		ic.addDiagnostic(invalidTLSConfigurationReason, "tls certificate not configured", fmt.Sprintf("tls:%d", tlsIndex))
+	}
 }
 
 // converts the default backend if any
@@ -481,6 +491,7 @@ func (ing *ingress) ingressV1Route(
 	df defaultFilters,
 	r *certregistry.CertRegistry,
 	loggingEnabled bool,
+	diagnostics *[]ingressDiagnostic,
 ) (*eskip.Route, error) {
 	if i.Metadata == nil || i.Metadata.Namespace == "" || i.Metadata.Name == "" || i.Spec == nil {
 		log.Error("invalid ingress item: missing Metadata or Spec")
@@ -508,6 +519,7 @@ func (ing *ingress) ingressV1Route(
 		calculateTraffic:     getBackendTrafficCalculator[*weightedIngressBackend](ing.backendTrafficAlgorithm),
 		zone:                 ing.zone,
 		disableZoneAwareness: i.Metadata.Annotations[trafficZoneAwareAnnotationKey] == "false",
+		diagnostics:          diagnostics,
 	}
 
 	var route *eskip.Route
@@ -516,18 +528,26 @@ func (ing *ingress) ingressV1Route(
 		ic.applyBackend(route)
 	} else if err != nil {
 		ic.logger.Errorf("Failed to convert default backend: %v", err)
+		ic.addDiagnostic(routeNotCreatedReason, "default backend not created", "default-backend")
 	}
 
-	for _, rule := range i.Spec.Rules {
-		err := ing.addSpecRuleV1(ic, rule)
+	for ruleIndex, rule := range i.Spec.Rules {
+		err := ing.addSpecRuleV1(ic, rule, ruleIndex)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if ic.certificateRegistry != nil {
-		for _, ingtls := range i.Spec.IngressTLS {
-			ing.addSpecIngressTLSV1(ic, ingtls)
+		for tlsIndex, ingtls := range i.Spec.IngressTLS {
+			ing.addSpecIngressTLSV1(ic, ingtls, tlsIndex)
 		}
 	}
 	return route, nil
+}
+
+func (ic *ingressContext) addDiagnostic(reason, note, occurrence string) {
+	if ic.diagnostics == nil {
+		return
+	}
+	*ic.diagnostics = append(*ic.diagnostics, ingressDiagnosticForMetadata(ic.ingressV1.Metadata, reason, note, occurrence))
 }

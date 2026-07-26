@@ -144,6 +144,11 @@ func TestOptionsFilterRegistry(t *testing.T) {
 	})
 }
 
+func TestKubernetesIngressEventOption(t *testing.T) {
+	options := (&Options{KubernetesEnableIngressEvents: true}).KubernetesDataClientOptions()
+	require.True(t, options.KubernetesEnableIngressEvents)
+}
+
 func TestOptionsOpenTracingTracerInstanceOverridesOpenTracing(t *testing.T) {
 	tracer := tracingtest.NewTracer()
 	o := Options{
